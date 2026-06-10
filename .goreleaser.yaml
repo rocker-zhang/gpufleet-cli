@@ -1,0 +1,35 @@
+# GoReleaser config for the gpufleet CLI (shipped binary).
+# arm64 is a first-class target; static builds (CGO disabled).
+version: 2
+
+project_name: gpufleet-cli
+
+builds:
+  - id: gpufleet
+    main: ./cmd/gpufleet
+    binary: gpufleet
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: gpufleet
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+sboms:
+  - artifacts: archive
+
+release:
+  prerelease: auto
