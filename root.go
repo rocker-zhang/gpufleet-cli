@@ -1,41 +1,47 @@
 package cli
 
 import (
-	"github.com/rocker-zhang/gpufleet-agent"
 	"github.com/spf13/cobra"
 )
 
-// NewRootCmd builds the gpufleet CLI. It wires agent + semantics (+ rca via the
-// rca subpackage) locally; no control plane is required.
+// NewRootCmd builds the gpufleet read-only bypass CLI. It is a pure VIEWER: it
+// HTTP-GETs the agent's local read-only API (D-0010 Endpoint 1) and renders a
+// deterministic single-node util/cost view. It assembles no evidence pack,
+// originates no HTTPS egress, talks to no control plane, and writes nothing back.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "gpufleet",
-		Short: "gpufleet local CLI — job-level utilization, cost, and deterministic RCA",
-		Long: "gpufleet wires the open collector, cost/efficiency semantics, and the\n" +
-			"deterministic RCA engine locally. It is standalone-useful with no\n" +
-			"control plane and contains no closed logic.",
+		Short: "gpufleet read-only viewer — job-level utilization & $cost from the agent's local API",
+		Long: "gpufleet is a read-only BYPASS viewer. It reads the agent's local\n" +
+			"read-only HTTP API (/signals + /cost) and renders a deterministic\n" +
+			"single-node utilization/cost view. It is off the critical path: it\n" +
+			"assembles no evidence pack, originates no egress, contacts no control\n" +
+			"plane, and never writes back. No control plane is required.",
 		SilenceUsage: true,
 	}
 
-	var node, jobID string
+	var endpoint string
 	viewCmd := &cobra.Command{
 		Use:   "view",
-		Short: "Collect evidence (mock by default) and print a job-level util/cost view",
+		Short: "Read the agent's local API (/signals + /cost) and print a deterministic util/cost view",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ev, err := agent.Collect(agent.DefaultReader(node))
+			c := NewClient(endpoint)
+			ctx := cmd.Context()
+
+			pack, err := c.Signals(ctx)
 			if err != nil {
 				return err
 			}
-			out, err := RenderJobView(jobID, ev)
+			cost, err := c.Cost(ctx)
 			if err != nil {
 				return err
 			}
-			cmd.Print(out)
+			cmd.Print(RenderView(pack, cost))
 			return nil
 		},
 	}
-	viewCmd.Flags().StringVar(&node, "node", "", "node name to stamp on evidence")
-	viewCmd.Flags().StringVar(&jobID, "job", "local-job", "job id to attribute devices to")
+	viewCmd.Flags().StringVar(&endpoint, "endpoint", DefaultEndpoint,
+		"agent local read-only API base URL (the agent serves -addr 127.0.0.1:9577)")
 
 	root.AddCommand(viewCmd)
 	return root

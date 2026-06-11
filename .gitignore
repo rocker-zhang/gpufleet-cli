@@ -1,7 +1,7 @@
 # Binaries
 /bin/
 /dist/
-gpufleet
+/gpufleet
 *.exe
 *.out
 *.test

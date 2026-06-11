@@ -1,100 +1,243 @@
-// Package cli wires the open gpufleet libraries (semantics + agent + rca)
-// together locally to render a job-level utilization/cost view. It is
-// standalone-useful with NO control-plane and contains NO closed logic.
+// Package cli is a read-only BYPASS viewer for the gpufleet agent's local HTTP
+// API (D-0010 Endpoint 1). It HTTP-GETs the agent's /signals (canonical
+// protojson of the REAL gpufleet.v1.EvidencePack gen type) and /cost (the
+// standalone cost wedge JSON) and renders a deterministic single-node table.
+//
+// cli is OFF the critical path (RULES §A; D-0008/D-0010): it NEVER assembles an
+// evidence pack, NEVER originates HTTPS egress, NEVER talks to a controlplane or
+// receives its Verdict, and NEVER writes back / controls anything. It only GETs
+// the agent's local API and renders. Rendering is deterministic (sorted, no
+// wall-clock) and passes the agent's values through verbatim — it fabricates no
+// value the agent did not send, and surfaces missing-field degrade marks.
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"sort"
 	"strings"
+	"time"
 
-	"github.com/rocker-zhang/gpufleet-agent"
-	"github.com/rocker-zhang/gpufleet-rca"
-	"github.com/rocker-zhang/gpufleet-semantics"
+	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// windowFromMetrics builds an rca.Window from a device's normalized evidence.
-// It maps the agent's raw observations onto independent rca signal names so the
-// deterministic engine can apply the >=2-signal gate. The CLI does no
-// adjudication itself — it only renders whatever the engine deterministically
-// decides (FIRE with cited signals, or ABSTAIN).
-func windowFromMetrics(d agent.DeviceMetrics) rca.Window {
-	var sigs []rca.Signal
-	for _, xid := range d.XIDs {
-		if xid == 79 {
-			sigs = append(sigs, rca.Signal{Name: "dmesg.xid79", Detail: "Xid 79"})
-		}
-	}
-	if d.ECCDoubleBitErrs > 0 {
-		sigs = append(sigs, rca.Signal{
-			Name:   "ecc.dbe.delta",
-			Detail: fmt.Sprintf("dbe delta=%d", d.ECCDoubleBitErrs),
-		})
-	}
-	return rca.Window{DeviceUUID: d.UUID, Signals: sigs}
+// DefaultEndpoint is the documented fixed localhost the agent serves on
+// (`agent -serve -addr 127.0.0.1:9577`). cli only ever reads this; it is a
+// local, off-path read and never an egress to any control plane.
+const DefaultEndpoint = "http://127.0.0.1:9577"
+
+// DeviceCost mirrors the agent /cost JSON shape for one device's cost wedge.
+// It is a thin wire DTO for decoding the agent's HTTP response — NOT a proto
+// mirror. The agent computes these values; cli passes them through verbatim.
+type DeviceCost struct {
+	UUID           string  `json:"uuid"`
+	Node           string  `json:"node"`
+	MFU            float64 `json:"mfu"`
+	TensorActive   float64 `json:"tensor_active"`
+	IdleFraction   float64 `json:"idle_fraction"`
+	CostUSD        float64 `json:"cost_usd"`
+	WastedUSD      float64 `json:"wasted_usd"`
+	Priced         bool    `json:"priced"`
+	LowUtilization bool    `json:"low_utilization"`
 }
 
-// PeakFLOPSByModel maps a device model to its peak FLOP/s for MFU math. These
-// are public reference numbers; the real values are supplied via config.
-var PeakFLOPSByModel = map[string]float64{
-	"A10":  1.25e14, // ~125 TFLOP/s BF16 tensor (reference)
-	"GB10": 1.0e15,  // placeholder reference peak
+// JobCost mirrors the agent /cost JSON shape for one job's aggregated wedge.
+type JobCost struct {
+	JobID     string  `json:"job_id"`
+	WastedUSD float64 `json:"wasted_usd"`
+	Priced    bool    `json:"priced"`
+	Devices   int     `json:"devices"`
 }
 
-// CostPerHourByModel maps a device model to a reference $/hour for attribution.
-var CostPerHourByModel = map[string]float64{
-	"A10":  1.20,
-	"GB10": 4.00,
+// CostResponse mirrors the agent /cost payload.
+type CostResponse struct {
+	Devices []DeviceCost `json:"devices"`
+	Jobs    []JobCost    `json:"jobs"`
 }
 
-// RenderJobView turns a collected evidence pack into a deterministic,
-// human-readable job-level utilization/cost view. All devices in the evidence
-// are attributed to the single given job (the local CLI does not resolve
-// multi-job ownership; that is the control plane's concern).
-func RenderJobView(jobID string, ev agent.Evidence) (string, error) {
-	var devs []semantics.DeviceEfficiency
-	for _, d := range ev.Devices {
-		spec := semantics.DeviceSpec{
-			PeakFLOPS:   PeakFLOPSByModel[d.Model],
-			CostPerHour: CostPerHourByModel[d.Model],
-		}
-		if spec.PeakFLOPS <= 0 {
-			return "", fmt.Errorf("cli: no peak FLOPS configured for model %q", d.Model)
-		}
-		eff, err := semantics.DeviceEff(semantics.DeviceSample{
-			Device:           semantics.Device{UUID: d.UUID, Node: d.Node, Model: d.Model},
-			WindowSeconds:    d.WindowSeconds,
-			AchievedFLOPs:    d.AchievedFLOPs,
-			TensorActiveSecs: d.TensorActiveSecs,
-		}, spec)
-		if err != nil {
-			return "", fmt.Errorf("cli: device %s: %w", d.UUID, err)
-		}
-		devs = append(devs, eff)
+// Client is a read-only HTTP client for the agent's local API. It performs only
+// GETs; it has no method that writes, uploads, or controls anything.
+type Client struct {
+	Endpoint string
+	HTTP     *http.Client
+}
+
+// NewClient builds a read-only client for the given endpoint. An empty endpoint
+// falls back to DefaultEndpoint.
+func NewClient(endpoint string) *Client {
+	if endpoint == "" {
+		endpoint = DefaultEndpoint
 	}
-
-	job := semantics.JobEff(semantics.Job{ID: jobID}, devs)
-
-	// Run the deterministic RCA engine over each device's evidence window.
-	eng := rca.NewEngine(rca.XID79{})
-	byUUID := make(map[string]agent.DeviceMetrics, len(ev.Devices))
-	for _, d := range ev.Devices {
-		byUUID[d.UUID] = d
+	return &Client{
+		Endpoint: strings.TrimRight(endpoint, "/"),
+		HTTP:     &http.Client{Timeout: 5 * time.Second},
 	}
+}
 
+func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Endpoint+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Defensive, contract-explicit: cli only ever GETs JSON from the agent's
+	// local read-only API. Still GET-only — no body, no mutating verb.
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cli: GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("cli: read %s: %w", path, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cli: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+// Signals GETs /signals and unmarshals it into the REAL gpufleet.v1.EvidencePack
+// gen type via protojson. cli is the 3rd real consumer of the gen module; it does
+// NOT hand-roll a proto mirror.
+func (c *Client) Signals(ctx context.Context) (*gpufleetv1.EvidencePack, error) {
+	body, err := c.get(ctx, "/signals")
+	if err != nil {
+		return nil, err
+	}
+	var pack gpufleetv1.EvidencePack
+	if err := protojson.Unmarshal(body, &pack); err != nil {
+		return nil, fmt.Errorf("cli: parse /signals as gpufleet.v1.EvidencePack: %w", err)
+	}
+	return &pack, nil
+}
+
+// Cost GETs /cost and decodes the agent's standalone cost-wedge JSON.
+func (c *Client) Cost(ctx context.Context) (*CostResponse, error) {
+	body, err := c.get(ctx, "/cost")
+	if err != nil {
+		return nil, err
+	}
+	var cost CostResponse
+	if err := json.Unmarshal(body, &cost); err != nil {
+		return nil, fmt.Errorf("cli: parse /cost JSON: %w", err)
+	}
+	return &cost, nil
+}
+
+// degradeMark is a missing-field degradation surfaced to the viewer. cli does
+// NOT invent these: a mark exists only where the agent's own state implies a
+// missing fact — an unpriced device (Priced==false → cost unknown), or a device
+// the agent mapped in /signals but omitted from /cost (its MFU inputs degraded,
+// so the agent did not fabricate a wedge). This mirrors the agent's own
+// "omit, don't fabricate" contract.
+type degradeMark struct {
+	DeviceUUID string
+	Field      string
+	Reason     string
+}
+
+// degradeMarks derives the missing-field marks deterministically from what the
+// agent actually sent across /signals and /cost. It fabricates no value.
+func degradeMarks(pack *gpufleetv1.EvidencePack, cost *CostResponse) []degradeMark {
+	costed := map[string]bool{}
+	for _, d := range cost.Devices {
+		costed[d.UUID] = true
+	}
+	var marks []degradeMark
+	// Devices the agent mapped but did NOT emit a cost wedge for: the agent
+	// degraded their MFU inputs and omitted them rather than fabricate a wedge.
+	if pack != nil {
+		for _, m := range pack.GetMappings() {
+			u := m.GetDeviceUuid()
+			if u != "" && !costed[u] {
+				marks = append(marks, degradeMark{u, "mfu", "agent omitted device from /cost (MFU inputs degraded)"})
+			}
+		}
+	}
+	// Devices the agent emitted but could not price.
+	for _, d := range cost.Devices {
+		if !d.Priced {
+			marks = append(marks, degradeMark{d.UUID, "cost", "agent reports device unpriced (no $/hour rate)"})
+		}
+	}
+	sort.Slice(marks, func(i, j int) bool {
+		if marks[i].DeviceUUID != marks[j].DeviceUUID {
+			return marks[i].DeviceUUID < marks[j].DeviceUUID
+		}
+		return marks[i].Field < marks[j].Field
+	})
+	return marks
+}
+
+// RenderView produces a deterministic, human-readable single-node view from the
+// agent's /signals EvidencePack and /cost wedge. Output is sorted (by device
+// UUID, then job id) and carries no wall-clock value, so the same inputs render
+// byte-identically. The Verdict column is fixed "n/a (no control plane)" — cli
+// has no rca/gate and NEVER fabricates a verdict (D-0008/D-0010).
+func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "job %s  (source=%s)\n", job.Job.ID, ev.Source)
-	fmt.Fprintf(&b, "  mean MFU:       %.3f\n", job.MeanMFU)
-	fmt.Fprintf(&b, "  straggler:      %.3f\n", job.StragglerRatio)
-	fmt.Fprintf(&b, "  cost (window):  $%.4f\n", job.CostUSD)
-	fmt.Fprintf(&b, "  devices:\n")
-	for _, d := range job.Devices {
-		v := eng.Evaluate(windowFromMetrics(byUUID[d.Device.UUID]))
-		rcaCol := v.Outcome.String()
-		if v.Outcome == rca.Fire {
-			rcaCol = fmt.Sprintf("FIRE:%s[%s]", v.FaultClass, strings.Join(v.CitedSignals, ","))
-		}
-		fmt.Fprintf(&b, "    %-16s mfu=%.3f tensor=%.3f $%.4f  rca=%s\n",
-			d.Device.UUID, d.MFU, d.TensorActive, d.CostUSD, rcaCol)
+
+	agentID := ""
+	if pack != nil {
+		agentID = pack.GetAgentId()
 	}
-	return b.String(), nil
+	fmt.Fprintf(&b, "gpufleet single-node view  (agent=%s, source=local read-only API)\n", agentID)
+
+	// Deterministic device table, sorted by UUID.
+	devs := append([]DeviceCost(nil), cost.Devices...)
+	sort.Slice(devs, func(i, j int) bool { return devs[i].UUID < devs[j].UUID })
+
+	fmt.Fprintf(&b, "\nDEVICES\n")
+	// The agent's /cost wire shape emits only per-window waste (`wasted_usd`); it
+	// does NOT serialize the cost wedge's per-hour rate (`UsdPerHour`). So this
+	// column is labelled `waste(win)` for exactly what the agent sends — cli does
+	// not fabricate a per-hour rate the agent did not emit.
+	fmt.Fprintf(&b, "  %-20s %-10s %6s %8s %12s %8s  %s\n",
+		"device", "node", "mfu", "tensor", "waste(win)", "lowutil", "verdict")
+	for _, d := range devs {
+		low := "-"
+		if d.LowUtilization {
+			low = "LOW"
+		}
+		wasted := fmt.Sprintf("$%.4f", d.WastedUSD)
+		if !d.Priced {
+			wasted = "n/a"
+		}
+		fmt.Fprintf(&b, "  %-20s %-10s %6.3f %8.3f %12s %8s  %s\n",
+			d.UUID, d.Node, d.MFU, d.TensorActive, wasted, low,
+			"n/a (no control plane)")
+	}
+
+	// Deterministic job table, sorted by job id.
+	jobs := append([]JobCost(nil), cost.Jobs...)
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].JobID < jobs[j].JobID })
+	if len(jobs) > 0 {
+		fmt.Fprintf(&b, "\nJOBS\n")
+		fmt.Fprintf(&b, "  %-20s %12s %8s %8s\n", "job", "waste(win)", "priced", "devices")
+		for _, j := range jobs {
+			wasted := fmt.Sprintf("$%.4f", j.WastedUSD)
+			priced := "yes"
+			if !j.Priced {
+				wasted = "n/a"
+				priced = "no"
+			}
+			fmt.Fprintf(&b, "  %-20s %12s %8s %8d\n", j.JobID, wasted, priced, j.Devices)
+		}
+	}
+
+	// Missing-field degrade marks, passed through from the agent's own state.
+	marks := degradeMarks(pack, cost)
+	if len(marks) > 0 {
+		fmt.Fprintf(&b, "\nDEGRADED (missing-field marks from agent)\n")
+		for _, m := range marks {
+			fmt.Fprintf(&b, "  %-20s %-12s %s\n", m.DeviceUUID, m.Field, m.Reason)
+		}
+	}
+
+	return b.String()
 }

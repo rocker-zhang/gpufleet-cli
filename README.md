@@ -2,38 +2,48 @@
 
 Apache-2.0 · OPEN module · `github.com/rocker-zhang/gpufleet-cli`
 
-The local CLI/TUI. It wires the open libraries — `gpufleet-agent` (collector),
-`gpufleet-semantics` (cost/efficiency math), and `gpufleet-rca` (deterministic
-RCA) — together on your machine to print a **job-level utilization/cost view**.
+A read-only **bypass viewer**. It HTTP-GETs the agent's local read-only API
+(`/signals` — canonical protojson of `gpufleet.v1.EvidencePack` — and `/cost`)
+and renders a deterministic **single-node utilization/cost view**. It is off the
+critical path: it assembles no evidence pack, originates no egress, contacts no
+control plane, and never writes back.
 
 It is **standalone-useful with no control plane** and contains **no closed
 logic**. The closed control plane (deep playbooks, the gate service, LLM
-narration) is never imported here.
+narration) is never imported here. RCA/Verdict is M3+, so the verdict column
+renders `n/a (no control plane)` — never fabricated.
 
 ## Use
 
+Start the agent's local read-only API, then point cli at it:
+
 ```sh
-go run ./cmd/gpufleet view --node my-host --job training-run-7
+agent -serve -addr 127.0.0.1:9577        # the agent (separate module)
+go run ./cmd/gpufleet view --endpoint http://127.0.0.1:9577
 ```
 
-Output (mock source by default — no GPU needed):
+`--endpoint` defaults to `http://127.0.0.1:9577`. Output (deterministic, sorted):
 
 ```
-job training-run-7  (source=mock)
-  mean MFU:       0.560
-  straggler:      0.500
-  cost (window):  $0.0400
-  devices:
-    GPU-mock-0001    mfu=0.080 tensor=0.700 $0.0200
-    GPU-mock-0002    mfu=0.040 tensor=0.333 $0.0200
+gpufleet single-node view  (agent=agent-test, source=local read-only API)
+
+DEVICES
+  device               node          mfu   tensor   waste(win)  lowutil  verdict
+  GPU-healthy          n1          0.620    0.700      $0.0000        -  n/a (no control plane)
+  GPU-idle             n1          0.010    0.020      $0.0190      LOW  n/a (no control plane)
+
+JOBS
+  job                    waste(win)   priced  devices
+  job-a                     $0.0190      yes        2
 ```
 
 ## Poly-repo note
 
-In CI the sibling `gpufleet-*` modules are consumed at pinned tags. For local
-development the `go.mod` uses `replace` directives pointing at the sibling repos;
-override with a `go.work` (or drop the replaces) to build against tagged
-releases.
+In CI the read-only `proto` gen module is consumed at its pinned tag
+(`proto/v0.1.0`). For local development the `go.mod` uses a single `replace`
+pointing at `../proto/gen/go`; override with a `go.work` (or drop the replace) to
+build against the tagged release. cli links **no** other sibling module — it
+reads the agent over HTTP, not as a Go dependency.
 
 ## Boundaries
 

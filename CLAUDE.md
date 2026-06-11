@@ -19,20 +19,24 @@ system — no telemetry, no evidence pack, no upload. It only **consumes** views
 and renders them deterministically.
 
 - **Consumes (Endpoint 1 — local agent API, OPEN/free, single-node)**: the
-  agent's local read-only API over a **unix socket**. Reads the normalized
-  SignalSchema window + the local Verdict + cost/MFU view for ONE node. This is
-  the standalone, no-control-plane path (the wedge demo).
+  agent's local read-only API over **localhost HTTP** (what the agent actually
+  serves: `agent -serve -addr 127.0.0.1:9577`; a unix socket may come later).
+  cli HTTP-GETs `/signals` (canonical protojson of `gpufleet.v1.EvidencePack`) +
+  `/cost` (the standalone cost wedge) and renders the cost/MFU view for ONE node.
+  This is the standalone, no-control-plane path (the wedge demo). Verdict/RCA is
+  M3+ — not served yet, so cli renders `n/a (no control plane)`, never fabricated.
 - **Consumes (Endpoint 2 — controlplane fleet API, CLOSED/PAID, fleet)**: the
   controlplane's fleet API for cross-node aggregation, fleet cost attribution,
   and the deep verdict. cli speaks only the **open thin wire contract** — the
   open `Verdict` + a small aggregation envelope defined in open `proto`. The
   closed implementation, data, and license gate all live server-side; cli stays
   fully open and "dumb".
-- **Optional direct mode**: cli may link `semantics` + `rca` as libraries for a
-  one-shot, agent-less local glance (the wedge math). Still **no** control-plane
-  edge, no upload.
-- **Edges**: cli → agent local API (unix socket, read); cli → controlplane fleet
-  API (read, paid). No other edges. See `../ARCHITECTURE.md` and D-0008 / D-0010.
+- **Direct mode (out of scope this milestone)**: a possible future card may link
+  `semantics` for an agent-less one-shot glance. TASK-0020 does **not** do this:
+  cli reads the agent over HTTP and links NO sibling Go module other than the
+  read-only `proto` gen contract (no agent, no rca, no semantics — TASK-0016).
+- **Edges**: cli → agent local API (localhost HTTP, read); cli → controlplane
+  fleet API (read, paid). No other edges. See `../ARCHITECTURE.md` and D-0008 / D-0010.
 
 ## 3. 继承的红线
 
@@ -41,7 +45,7 @@ Inherits `../RULES.md` in full. Module-specific hard lines:
 - **Read-only bypass viewer.** NEVER uploads, NEVER originates evidence-pack
   egress. Reading a fleet view from the controlplane is a *read*; the agent is
   the sole HTTPS egress and sole evidence-pack assembler (D-0008 invariant holds).
-- **Two endpoints (D-0010)**: Endpoint 1 = local agent API (unix socket) =
+- **Two endpoints (D-0010)**: Endpoint 1 = local agent API (localhost HTTP) =
   single-node = OPEN/free. Endpoint 2 = controlplane fleet API = cross-node
   aggregation + fleet cost + deep verdict = CLOSED/PAID (the selling point / 买点).
 - **No license logic in cli.** License is enforced SERVER-SIDE at the
