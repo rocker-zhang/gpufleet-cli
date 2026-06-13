@@ -59,9 +59,23 @@ type JobCost struct {
 }
 
 // CostResponse mirrors the agent /cost payload.
+//
+// CollectedAt / AgeSeconds / Stale / StaleReason are the data-freshness fields
+// (TASK-0040), reported by the agent at the TOP level (freshness is a property of
+// the whole window, not one device). The viewer renders a data-age line and, when
+// Stale is true, a prominent STALE marker + the agent's reason — it does NOT
+// recompute staleness, it passes the agent's verdict through verbatim (the agent
+// owns the threshold; cli stays a read-only viewer). When fresh, Stale is false
+// and StaleReason empty. These are an ADDITIVE top-level extension; the per-device
+// DeviceCost/JobCost DTOs are unchanged, so the committed cost golden still
+// decodes (it simply omits these and they stay zero/false).
 type CostResponse struct {
-	Devices []DeviceCost `json:"devices"`
-	Jobs    []JobCost    `json:"jobs"`
+	Devices     []DeviceCost `json:"devices"`
+	Jobs        []JobCost    `json:"jobs"`
+	CollectedAt time.Time    `json:"collected_at,omitempty"`
+	AgeSeconds  float64      `json:"age_seconds"`
+	Stale       bool         `json:"stale"`
+	StaleReason string       `json:"stale_reason,omitempty"`
 }
 
 // Client is a read-only HTTP client for the agent's local API. It performs only
@@ -192,6 +206,24 @@ func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 		agentID = pack.GetAgentId()
 	}
 	fmt.Fprintf(&b, "gpufleet single-node view  (agent=%s, source=local read-only API)\n", agentID)
+
+	// Data-freshness line (TASK-0040): the agent-side age since its last SUCCESSFUL
+	// collection, passed through verbatim from /cost (deterministic — no cli
+	// wall-clock). When the agent reports stale, surface a prominent STALE marker +
+	// the agent's reason so a held-stale window is NEVER shown as current (RULES
+	// §B). The data values below are the last-known window, kept but explicitly
+	// flagged — not blanked, not fabricated.
+	fmt.Fprintf(&b, "data age: %.1fs", cost.AgeSeconds)
+	if cost.Stale {
+		fmt.Fprintf(&b, "   *** STALE ***")
+		if cost.StaleReason != "" {
+			fmt.Fprintf(&b, "  (%s)", cost.StaleReason)
+		}
+	}
+	fmt.Fprintf(&b, "\n")
+	if cost.Stale {
+		fmt.Fprintf(&b, "NOTE: data below is STALE (last-known values held, NOT live) — do not treat as current.\n")
+	}
 
 	// Deterministic device table, sorted by UUID.
 	devs := append([]DeviceCost(nil), cost.Devices...)
