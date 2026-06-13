@@ -34,23 +34,28 @@ const DefaultEndpoint = "http://127.0.0.1:9577"
 // It is a thin wire DTO for decoding the agent's HTTP response — NOT a proto
 // mirror. The agent computes these values; cli passes them through verbatim.
 type DeviceCost struct {
-	UUID           string  `json:"uuid"`
-	Node           string  `json:"node"`
-	MFU            float64 `json:"mfu"`
-	TensorActive   float64 `json:"tensor_active"`
-	IdleFraction   float64 `json:"idle_fraction"`
-	CostUSD        float64 `json:"cost_usd"`
+	UUID         string  `json:"uuid"`
+	Node         string  `json:"node"`
+	MFU          float64 `json:"mfu"`
+	TensorActive float64 `json:"tensor_active"`
+	IdleFraction float64 `json:"idle_fraction"`
+	CostUSD      float64 `json:"cost_usd"`
+	// WastedUSD is per-WINDOW waste; UsdPerHour is the per-HOUR burn RATE. Both
+	// are meaningful ONLY when Priced==true (agent CLAUDE.md §5a); when Priced is
+	// false they are zero and carry no meaning, so the viewer degrade-marks them.
 	WastedUSD      float64 `json:"wasted_usd"`
+	UsdPerHour     float64 `json:"usd_per_hour"`
 	Priced         bool    `json:"priced"`
 	LowUtilization bool    `json:"low_utilization"`
 }
 
 // JobCost mirrors the agent /cost JSON shape for one job's aggregated wedge.
 type JobCost struct {
-	JobID     string  `json:"job_id"`
-	WastedUSD float64 `json:"wasted_usd"`
-	Priced    bool    `json:"priced"`
-	Devices   int     `json:"devices"`
+	JobID      string  `json:"job_id"`
+	WastedUSD  float64 `json:"wasted_usd"`
+	UsdPerHour float64 `json:"usd_per_hour"`
+	Priced     bool    `json:"priced"`
+	Devices    int     `json:"devices"`
 }
 
 // CostResponse mirrors the agent /cost payload.
@@ -193,23 +198,29 @@ func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 	sort.Slice(devs, func(i, j int) bool { return devs[i].UUID < devs[j].UUID })
 
 	fmt.Fprintf(&b, "\nDEVICES\n")
-	// The agent's /cost wire shape emits only per-window waste (`wasted_usd`); it
-	// does NOT serialize the cost wedge's per-hour rate (`UsdPerHour`). So this
-	// column is labelled `waste(win)` for exactly what the agent sends — cli does
-	// not fabricate a per-hour rate the agent did not emit.
-	fmt.Fprintf(&b, "  %-20s %-10s %6s %8s %12s %8s  %s\n",
-		"device", "node", "mfu", "tensor", "waste(win)", "lowutil", "verdict")
+	// Two distinct money columns straight from the agent's /cost wire (agent
+	// CLAUDE.md §5a): `waste(win)` is the per-WINDOW waste (`wasted_usd`) and
+	// `$/hr` is the per-HOUR burn RATE (`usd_per_hour`, semantics
+	// CostImpact.UsdPerHour). For an idle device over a sub-hour window the $/hr
+	// rate exceeds the windowed waste. cli passes both through verbatim; when the
+	// agent reports priced==false (no $/hr rate) it shows a degrade mark `n/a`,
+	// NEVER a fabricated $0.
+	fmt.Fprintf(&b, "  %-20s %-10s %6s %8s %12s %12s %8s  %s\n",
+		"device", "node", "mfu", "tensor", "waste(win)", "$/hr", "lowutil", "verdict")
 	for _, d := range devs {
 		low := "-"
 		if d.LowUtilization {
 			low = "LOW"
 		}
 		wasted := fmt.Sprintf("$%.4f", d.WastedUSD)
+		perHour := fmt.Sprintf("$%.4f", d.UsdPerHour)
 		if !d.Priced {
+			// priced==false ⇒ the $ fields carry no meaning; degrade-mark, not $0.
 			wasted = "n/a"
+			perHour = "n/a"
 		}
-		fmt.Fprintf(&b, "  %-20s %-10s %6.3f %8.3f %12s %8s  %s\n",
-			d.UUID, d.Node, d.MFU, d.TensorActive, wasted, low,
+		fmt.Fprintf(&b, "  %-20s %-10s %6.3f %8.3f %12s %12s %8s  %s\n",
+			d.UUID, d.Node, d.MFU, d.TensorActive, wasted, perHour, low,
 			"n/a (no control plane)")
 	}
 
@@ -218,15 +229,17 @@ func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].JobID < jobs[j].JobID })
 	if len(jobs) > 0 {
 		fmt.Fprintf(&b, "\nJOBS\n")
-		fmt.Fprintf(&b, "  %-20s %12s %8s %8s\n", "job", "waste(win)", "priced", "devices")
+		fmt.Fprintf(&b, "  %-20s %12s %12s %8s %8s\n", "job", "waste(win)", "$/hr", "priced", "devices")
 		for _, j := range jobs {
 			wasted := fmt.Sprintf("$%.4f", j.WastedUSD)
+			perHour := fmt.Sprintf("$%.4f", j.UsdPerHour)
 			priced := "yes"
 			if !j.Priced {
 				wasted = "n/a"
+				perHour = "n/a"
 				priced = "no"
 			}
-			fmt.Fprintf(&b, "  %-20s %12s %8s %8d\n", j.JobID, wasted, priced, j.Devices)
+			fmt.Fprintf(&b, "  %-20s %12s %12s %8s %8d\n", j.JobID, wasted, perHour, priced, j.Devices)
 		}
 	}
 

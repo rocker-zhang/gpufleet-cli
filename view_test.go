@@ -41,11 +41,11 @@ func agentStub(t *testing.T) *httptest.Server {
 	signals := realSignalsProtoJSON(t)
 	costJSON := `{
 	  "devices": [
-	    {"uuid":"GPU-healthy","node":"n1","mfu":0.62,"tensor_active":0.70,"idle_fraction":0.05,"cost_usd":0.0200,"wasted_usd":0.0,"priced":true,"low_utilization":false},
-	    {"uuid":"GPU-idle","node":"n1","mfu":0.01,"tensor_active":0.02,"idle_fraction":0.95,"cost_usd":0.0200,"wasted_usd":0.0190,"priced":true,"low_utilization":true}
+	    {"uuid":"GPU-healthy","node":"n1","mfu":0.62,"tensor_active":0.70,"idle_fraction":0.05,"cost_usd":0.0200,"wasted_usd":0.0,"usd_per_hour":0.0,"priced":true,"low_utilization":false},
+	    {"uuid":"GPU-idle","node":"n1","mfu":0.01,"tensor_active":0.02,"idle_fraction":0.95,"cost_usd":0.0200,"wasted_usd":0.0190,"usd_per_hour":1.1400,"priced":true,"low_utilization":true}
 	  ],
 	  "jobs": [
-	    {"job_id":"job-a","wasted_usd":0.0190,"priced":true,"devices":2}
+	    {"job_id":"job-a","wasted_usd":0.0190,"usd_per_hour":1.1400,"priced":true,"devices":2}
 	  ]
 	}`
 	mux := http.NewServeMux()
