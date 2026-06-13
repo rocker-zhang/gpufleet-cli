@@ -14,6 +14,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,7 +76,13 @@ type CostResponse struct {
 	CollectedAt time.Time    `json:"collected_at,omitempty"`
 	AgeSeconds  float64      `json:"age_seconds"`
 	Stale       bool         `json:"stale"`
-	StaleReason string       `json:"stale_reason,omitempty"`
+	// NeverCollected (TASK-0041) is the agent's MOST-stale state: it has not once
+	// successfully scraped metrics (e.g. the exporter was unreachable from
+	// startup), so /cost returns 200 with empty devices, stale=true,
+	// never_collected=true, and a reason. The viewer renders a clear human message
+	// ("agent has not collected data yet — <reason>") rather than a blank table.
+	NeverCollected bool   `json:"never_collected"`
+	StaleReason    string `json:"stale_reason,omitempty"`
 }
 
 // Client is a read-only HTTP client for the agent's local API. It performs only
@@ -115,10 +122,31 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
 		return nil, fmt.Errorf("cli: read %s: %w", path, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("cli: GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+		// Return a TYPED status error carrying the body so callers (Cost) can
+		// distinguish an agent that answered non-200 (e.g. a never-collected 503 from
+		// an older agent) from a transport failure, and degrade gracefully instead of
+		// bubbling a raw HTTP error to the user (TASK-0041).
+		return nil, &statusError{path: path, code: resp.StatusCode, body: body}
 	}
 	return body, nil
 }
+
+// statusError is a non-200 HTTP response from the agent's local API. It carries
+// the response body so a caller can try to decode it (e.g. a never-collected
+// /cost) before falling back to a human message.
+type statusError struct {
+	path string
+	code int
+	body []byte
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("cli: GET %s: status %d: %s", e.path, e.code, e.text())
+}
+
+// text is the trimmed response body, used as a human reason when the body is not
+// structured JSON.
+func (e *statusError) text() string { return strings.TrimSpace(string(e.body)) }
 
 // Signals GETs /signals and unmarshals it into the REAL gpufleet.v1.EvidencePack
 // gen type via protojson. cli is the 3rd real consumer of the gen module; it does
@@ -136,9 +164,38 @@ func (c *Client) Signals(ctx context.Context) (*gpufleetv1.EvidencePack, error) 
 }
 
 // Cost GETs /cost and decodes the agent's standalone cost-wedge JSON.
+//
+// Never-collected resilience (TASK-0041): the agent serves never-collected as a
+// 200 JSON body (stale + never_collected + reason), which decodes normally. But
+// an OLDER agent (or any non-200 from /cost) MUST still degrade to a clear empty
+// state, not a raw HTTP error: when get() returns a status error whose body is a
+// decodable CostResponse, use it; otherwise synthesize a NeverCollected response
+// carrying the agent's error text as the reason. Either way RenderView prints a
+// human message, never a bubbled raw HTTP error and never a silent blank.
 func (c *Client) Cost(ctx context.Context) (*CostResponse, error) {
 	body, err := c.get(ctx, "/cost")
 	if err != nil {
+		var serr *statusError
+		if errors.As(err, &serr) {
+			// The agent answered but not 200 (e.g. an older agent's 503 "no signal
+			// window collected yet"). Treat it as a never-collected empty state.
+			var cost CostResponse
+			if jerr := json.Unmarshal(serr.body, &cost); jerr == nil && (cost.NeverCollected || len(cost.Devices) == 0) {
+				cost.NeverCollected = true
+				cost.Stale = true
+				if cost.StaleReason == "" {
+					cost.StaleReason = serr.text()
+				}
+				return &cost, nil
+			}
+			return &CostResponse{
+				NeverCollected: true,
+				Stale:          true,
+				StaleReason:    serr.text(),
+			}, nil
+		}
+		// A transport error (agent down / connection refused) is NOT a never-collected
+		// agent — return it so the caller surfaces "cannot reach the agent".
 		return nil, err
 	}
 	var cost CostResponse
@@ -201,11 +258,35 @@ func degradeMarks(pack *gpufleetv1.EvidencePack, cost *CostResponse) []degradeMa
 func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 	var b strings.Builder
 
+	// Defensive: a nil cost means the caller had no cost payload at all. Treat it as
+	// the never-collected empty state rather than panicking (TASK-0041).
+	if cost == nil {
+		cost = &CostResponse{NeverCollected: true, Stale: true,
+			StaleReason: "agent returned no cost data"}
+	}
+
 	agentID := ""
 	if pack != nil {
 		agentID = pack.GetAgentId()
 	}
 	fmt.Fprintf(&b, "gpufleet single-node view  (agent=%s, source=local read-only API)\n", agentID)
+
+	// NEVER-COLLECTED empty state (TASK-0041): the agent has not once successfully
+	// scraped metrics (exporter unreachable from startup, etc.), so there are no
+	// device values to show. Render a CLEAR human message — never a raw HTTP error,
+	// never a silently blank table — and stop. This also covers the defensive case
+	// where /cost returned no devices while flagged stale (an older agent's empty
+	// 503 body decoded into NeverCollected by Client.Cost).
+	if cost.NeverCollected || (cost.Stale && len(cost.Devices) == 0) {
+		reason := cost.StaleReason
+		if reason == "" {
+			reason = "agent has not collected any metrics yet (exporter unreachable?)"
+		}
+		fmt.Fprintf(&b, "*** NO DATA ***  the agent has not collected any GPU metrics yet\n")
+		fmt.Fprintf(&b, "reason: %s\n", reason)
+		fmt.Fprintf(&b, "the exporter may be unreachable, or the agent just started — retry shortly.\n")
+		return b.String()
+	}
 
 	// Data-freshness line (TASK-0040): the agent-side age since its last SUCCESSFUL
 	// collection, passed through verbatim from /cost (deterministic — no cli

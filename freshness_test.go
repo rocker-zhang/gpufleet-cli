@@ -133,3 +133,102 @@ func TestStaleRenderDeterministic(t *testing.T) {
 		t.Errorf("stale render not deterministic")
 	}
 }
+
+// neverCollectedAgentStub mimics the TASK-0041 agent: /cost returns 200 with
+// empty devices, stale=true, never_collected=true, and a reason (the exporter was
+// unreachable from startup). /signals returns 503 like the real agent before any
+// window exists — Client.Signals surfaces that error, but the view command reads
+// /cost too, and cli must render a clear message off /cost.
+func neverCollectedAgentStub(t *testing.T) *httptest.Server {
+	t.Helper()
+	costJSON := `{
+	  "devices": [],
+	  "jobs": [],
+	  "age_seconds": 9.0,
+	  "stale": true,
+	  "never_collected": true,
+	  "stale_reason": "never collected: no successful metrics scrape since startup (1 consecutive metrics-collection failure(s): connection refused)"
+	}`
+	mux := http.NewServeMux()
+	mux.HandleFunc("/signals", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no signal window collected yet", http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/cost", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(costJSON))
+	})
+	return httptest.NewServer(mux)
+}
+
+// TestRenderNeverCollectedGraceful is the TASK-0041 cli DoD: on a never-collected
+// agent (200 /cost with empty devices + never_collected=true), RenderView prints a
+// CLEAR human message carrying the agent's reason — never a blank table, never a
+// raw HTTP error.
+func TestRenderNeverCollectedGraceful(t *testing.T) {
+	srv := neverCollectedAgentStub(t)
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	cost, err := c.Cost(context.Background())
+	if err != nil {
+		t.Fatalf("Cost on a never-collected (200) agent must not error: %v", err)
+	}
+	if !cost.NeverCollected || !cost.Stale {
+		t.Fatalf("never-collected /cost should decode never_collected+stale: %+v", cost)
+	}
+
+	out := RenderView(nil, cost) // /signals was 503, so pack may be nil — must not panic
+	if !strings.Contains(out, "NO DATA") {
+		t.Errorf("expected a clear NO DATA message:\n%s", out)
+	}
+	if !strings.Contains(out, "has not collected") {
+		t.Errorf("expected a human 'has not collected' message:\n%s", out)
+	}
+	if !strings.Contains(out, "never collected") {
+		t.Errorf("expected the agent's reason to be surfaced:\n%s", out)
+	}
+	// Never a raw HTTP error / never a blank device table.
+	if strings.Contains(out, "status 5") || strings.Contains(out, "DEVICES\n") {
+		t.Errorf("never-collected render must not show a raw HTTP error or a blank device table:\n%s", out)
+	}
+}
+
+// TestCostGracefulOn503 proves the defensive path for an OLDER agent that still
+// returns 503 "no signal window collected yet" on /cost (pre-TASK-0041 behavior):
+// Client.Cost must degrade it to a NeverCollected empty state carrying the agent's
+// body as the reason, NOT bubble a raw HTTP status error.
+func TestCostGracefulOn503(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cost", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no signal window collected yet", http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cost, err := NewClient(srv.URL).Cost(context.Background())
+	if err != nil {
+		t.Fatalf("a 503 /cost must degrade gracefully, not error: %v", err)
+	}
+	if !cost.NeverCollected || !cost.Stale {
+		t.Fatalf("503 /cost must become a never-collected empty state: %+v", cost)
+	}
+	if !strings.Contains(cost.StaleReason, "no signal window collected yet") {
+		t.Fatalf("503 reason should carry the agent's message: %q", cost.StaleReason)
+	}
+	out := RenderView(nil, cost)
+	if !strings.Contains(out, "NO DATA") || strings.Contains(out, "status 503") {
+		t.Errorf("503 must render a clear message, not a raw HTTP error:\n%s", out)
+	}
+}
+
+// TestCostTransportErrorStillErrors proves we did NOT over-swallow: when the agent
+// is unreachable (connection refused — a transport error, not a non-200), Cost
+// still returns an error so the caller can say "cannot reach the agent". A
+// never-collected agent (reachable, 200/503) is distinct from a down agent.
+func TestCostTransportErrorStillErrors(t *testing.T) {
+	// An unroutable endpoint: nothing listening.
+	c := NewClient("http://127.0.0.1:0")
+	if _, err := c.Cost(context.Background()); err == nil {
+		t.Fatalf("a transport failure (agent down) must still surface an error")
+	}
+}
