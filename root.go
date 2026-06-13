@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
 )
 
@@ -28,15 +30,40 @@ func NewRootCmd() *cobra.Command {
 			c := NewClient(endpoint)
 			ctx := cmd.Context()
 
-			pack, err := c.Signals(ctx)
-			if err != nil {
-				return err
-			}
+			// Fetch /cost first: Client.Cost degrades a never-collected agent
+			// (which serves 503/empty on /signals before any window exists) into a
+			// NeverCollected empty state instead of erroring (TASK-0041). A real
+			// transport error here (agent down / connection refused) is a genuine
+			// failure and is returned so the entrypoint reports it on STDERR.
 			cost, err := c.Cost(ctx)
 			if err != nil {
 				return err
 			}
-			cmd.Print(RenderView(pack, cost))
+
+			// /signals is only needed for the degrade-marks cross-check and the
+			// agent id. In the no-data state the agent has no signal window yet and
+			// answers /signals with a non-200, so a /signals error there is NORMAL,
+			// not fatal: render the friendly NO-DATA banner off /cost with a nil
+			// pack (exactly what RenderView(nil, cost) already produces). Only when
+			// /cost has real data do we treat a /signals failure as a hard error.
+			pack, serr := c.Signals(ctx)
+			if serr != nil {
+				noData := cost == nil || cost.NeverCollected || (cost.Stale && len(cost.Devices) == 0)
+				if !noData {
+					return serr
+				}
+				pack = nil
+			}
+
+			// The rendered view is the command's PRIMARY output and MUST go to
+			// STDOUT so it is pipeable / capturable / redirectable (TASK-0042).
+			// The friendly NO-DATA and STALE banners are NORMAL output and ride
+			// the same stdout stream; only real errors (returned from RunE and
+			// printed by main to os.Stderr) belong on stderr. Note cmd.Print uses
+			// cobra's OutOrStderr() fallback (= os.Stderr when no writer is set),
+			// which is exactly the stream-separation bug — write to OutOrStdout()
+			// explicitly instead.
+			fmt.Fprint(cmd.OutOrStdout(), RenderView(pack, cost))
 			return nil
 		},
 	}
