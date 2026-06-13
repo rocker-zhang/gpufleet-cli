@@ -62,6 +62,25 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: go build -o /dev/null ./cmd/gpufleet
 
+  # TASK-0031: prove the RELEASE consumption path (resolve the proto gen module
+  # by its pinned tag, no local `replace`). See agent/ci.yml for the full
+  # rationale. PREREQUISITE (outside this repo): proto publishes tag
+  # `gen/go/v0.1.0` + private-repo auth via GOPRIVATE. SOFT until repo variable
+  # PROTO_GEN_TAG_PUBLISHED=true.
+  require-by-tag:
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: resolve gen module by pinned tag (no replace)
+        env:
+          VERIFY_BY_TAG_SOFT: ${{ vars.PROTO_GEN_TAG_PUBLISHED == 'true' && '0' || '1' }}
+        run: bash ci/verify-by-tag.sh
+
   supply-chain:
     needs: [test]
     runs-on: ubuntu-24.04
