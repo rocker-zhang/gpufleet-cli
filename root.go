@@ -23,6 +23,7 @@ func NewRootCmd() *cobra.Command {
 	}
 
 	var endpoint string
+	var fullUUID bool
 	viewCmd := &cobra.Command{
 		Use:   "view",
 		Short: "Read the agent's local API (/signals + /cost) and print a deterministic util/cost view",
@@ -63,12 +64,18 @@ func NewRootCmd() *cobra.Command {
 			// cobra's OutOrStderr() fallback (= os.Stderr when no writer is set),
 			// which is exactly the stream-separation bug — write to OutOrStdout()
 			// explicitly instead.
-			fmt.Fprint(cmd.OutOrStdout(), RenderView(pack, cost))
+			render := RenderView
+			if fullUUID {
+				render = RenderViewFull
+			}
+			fmt.Fprint(cmd.OutOrStdout(), render(pack, cost))
 			return nil
 		},
 	}
 	viewCmd.Flags().StringVar(&endpoint, "endpoint", DefaultEndpoint,
 		"agent local read-only API base URL (the agent serves -addr 127.0.0.1:9577)")
+	viewCmd.Flags().BoolVar(&fullUUID, "full-uuid", false,
+		"show the full device UUID instead of the default short prefix")
 
 	root.AddCommand(viewCmd)
 	return root

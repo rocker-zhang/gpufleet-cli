@@ -18,11 +18,18 @@ import (
 // so it MUST land in the stdout buffer.
 func runView(t *testing.T, endpoint string) (stdout, stderr string, err error) {
 	t.Helper()
+	return runViewArgs(t, "view", "--endpoint", endpoint)
+}
+
+// runViewArgs is runView with arbitrary args, so a test can exercise flags such
+// as --full-uuid while keeping the same stdout/stderr stream-separation harness.
+func runViewArgs(t *testing.T, args ...string) (stdout, stderr string, err error) {
+	t.Helper()
 	var out, errOut bytes.Buffer
 	root := NewRootCmd()
 	root.SetOut(&out)
 	root.SetErr(&errOut)
-	root.SetArgs([]string{"view", "--endpoint", endpoint})
+	root.SetArgs(args)
 	err = root.ExecuteContext(context.Background())
 	return out.String(), errOut.String(), err
 }

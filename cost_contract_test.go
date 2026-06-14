@@ -89,7 +89,11 @@ func TestRenderPerHourColumn(t *testing.T) {
 	// not required for the $/hr assertions but keeps the render realistic.
 	pack := &gpufleetv1.EvidencePack{AgentId: "golden"}
 
-	out := RenderView(pack, &cost)
+	// Render with FULL UUIDs: this test matches device rows by their complete
+	// UUID (e.g. "GPU-mock-unpriced", 17 chars) so it must use the --full-uuid
+	// render; the default short-prefix path is covered by view_test.go
+	// (TASK-0043). The $ values asserted below are display-identical in both.
+	out := RenderViewFull(pack, &cost)
 
 	// Header carries the new $/hr column alongside waste(win).
 	if !strings.Contains(out, "$/hr") {

@@ -20,11 +20,34 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	gpufleetv1 "github.com/rocker-zhang/gpufleet-proto/gen/go/gpufleet/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 )
+
+// shortUUIDLen is the number of leading characters of a device UUID kept in the
+// default (short) render. A typical NVML UUID is "GPU-<8-4-4-4-12 hex>" (40
+// chars incl. the "GPU-" prefix); the first 13 chars ("GPU-" + the first hex
+// block, e.g. "GPU-1e760802-") are enough to recognize a device at a glance
+// while keeping the DEVICES table narrow. The full UUID is available via the
+// view command's --full-uuid flag (RenderViewFull / TASK-0043).
+const shortUUIDLen = 13
+
+// shortUUID returns a recognizable prefix of a device UUID for the default
+// render: the first shortUUIDLen runes followed by a single-rune ellipsis when
+// the UUID is longer. Short UUIDs (e.g. the test fixtures "GPU-idle") are
+// returned unchanged so nothing is truncated that already fits. It is
+// rune-aware so it never splits a multi-byte rune. This affects DISPLAY ONLY —
+// no value/semantics change (TASK-0043).
+func shortUUID(uuid string) string {
+	r := []rune(uuid)
+	if len(r) <= shortUUIDLen {
+		return uuid
+	}
+	return string(r[:shortUUIDLen]) + "…"
+}
 
 // DefaultEndpoint is the documented fixed localhost the agent serves on
 // (`agent -serve -addr 127.0.0.1:9577`). cli only ever reads this; it is a
@@ -255,7 +278,25 @@ func degradeMarks(pack *gpufleetv1.EvidencePack, cost *CostResponse) []degradeMa
 // UUID, then job id) and carries no wall-clock value, so the same inputs render
 // byte-identically. The Verdict column is fixed "n/a (no control plane)" — cli
 // has no rca/gate and NEVER fabricates a verdict (D-0008/D-0010).
+//
+// The default render shows each device UUID as a recognizable SHORT prefix so
+// the DEVICES/JOBS columns stay narrow and aligned (TASK-0043). Use
+// RenderViewFull for the whole UUID (the view command's --full-uuid flag).
 func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
+	return renderView(pack, cost, false)
+}
+
+// RenderViewFull is RenderView but prints the FULL device UUID instead of the
+// short prefix. It backs the view command's --full-uuid flag (TASK-0043). It
+// changes DISPLAY ONLY — every value/semantic and the deterministic order are
+// identical to RenderView.
+func RenderViewFull(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
+	return renderView(pack, cost, true)
+}
+
+// renderView is the shared renderer. fullUUID selects the long vs short UUID
+// display; everything else (values, banners, order, columns) is identical.
+func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, fullUUID bool) string {
 	var b strings.Builder
 
 	// Defensive: a nil cost means the caller had no cost payload at all. Treat it as
@@ -310,16 +351,26 @@ func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 	devs := append([]DeviceCost(nil), cost.Devices...)
 	sort.Slice(devs, func(i, j int) bool { return devs[i].UUID < devs[j].UUID })
 
-	fmt.Fprintf(&b, "\nDEVICES\n")
+	// DEVICES table, rendered through text/tabwriter so columns auto-size to
+	// their content and the header lines up with every row even when a device
+	// UUID is the full 36-char NVML id (TASK-0043). Text columns are left-aligned
+	// (the tabwriter default); numeric columns are pre-justified right so they
+	// align on their right edge under right-justified headers (mixedTable does
+	// the per-column padding before tabwriter adds the inter-column gap).
+	//
 	// Two distinct money columns straight from the agent's /cost wire (agent
 	// CLAUDE.md §5a): `waste(win)` is the per-WINDOW waste (`wasted_usd`) and
 	// `$/hr` is the per-HOUR burn RATE (`usd_per_hour`, semantics
 	// CostImpact.UsdPerHour). For an idle device over a sub-hour window the $/hr
 	// rate exceeds the windowed waste. cli passes both through verbatim; when the
 	// agent reports priced==false (no $/hr rate) it shows a degrade mark `n/a`,
-	// NEVER a fabricated $0.
-	fmt.Fprintf(&b, "  %-20s %-10s %6s %8s %12s %12s %8s  %s\n",
-		"device", "node", "mfu", "tensor", "waste(win)", "$/hr", "lowutil", "verdict")
+	// NEVER a fabricated $0. Switching to tabwriter changes LAYOUT ONLY — no
+	// value/semantic, sort, banner, or verdict changes.
+	fmt.Fprintf(&b, "\nDEVICES\n")
+	devTable := newTable(
+		[]string{"device", "node", "mfu", "tensor", "waste(win)", "$/hr", "lowutil", "verdict"},
+		[]bool{false, false, true, true, true, true, false, false}, // numeric cols right-aligned
+	)
 	for _, d := range devs {
 		low := "-"
 		if d.LowUtilization {
@@ -332,17 +383,27 @@ func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 			wasted = "n/a"
 			perHour = "n/a"
 		}
-		fmt.Fprintf(&b, "  %-20s %-10s %6.3f %8.3f %12s %12s %8s  %s\n",
-			d.UUID, d.Node, d.MFU, d.TensorActive, wasted, perHour, low,
-			"n/a (no control plane)")
+		uuid := d.UUID
+		if !fullUUID {
+			uuid = shortUUID(uuid)
+		}
+		devTable.row(
+			uuid, d.Node,
+			fmt.Sprintf("%.3f", d.MFU), fmt.Sprintf("%.3f", d.TensorActive),
+			wasted, perHour, low, "n/a (no control plane)",
+		)
 	}
+	devTable.flush(&b)
 
 	// Deterministic job table, sorted by job id.
 	jobs := append([]JobCost(nil), cost.Jobs...)
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].JobID < jobs[j].JobID })
 	if len(jobs) > 0 {
 		fmt.Fprintf(&b, "\nJOBS\n")
-		fmt.Fprintf(&b, "  %-20s %12s %12s %8s %8s\n", "job", "waste(win)", "$/hr", "priced", "devices")
+		jobTable := newTable(
+			[]string{"job", "waste(win)", "$/hr", "priced", "devices"},
+			[]bool{false, true, true, false, true},
+		)
 		for _, j := range jobs {
 			wasted := fmt.Sprintf("$%.4f", j.WastedUSD)
 			perHour := fmt.Sprintf("$%.4f", j.UsdPerHour)
@@ -352,18 +413,97 @@ func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
 				perHour = "n/a"
 				priced = "no"
 			}
-			fmt.Fprintf(&b, "  %-20s %12s %12s %8s %8d\n", j.JobID, wasted, perHour, priced, j.Devices)
+			jobTable.row(j.JobID, wasted, perHour, priced, fmt.Sprintf("%d", j.Devices))
 		}
+		jobTable.flush(&b)
 	}
 
-	// Missing-field degrade marks, passed through from the agent's own state.
+	// Missing-field degrade marks, passed through from the agent's own state. The
+	// degrade marks still carry the FULL UUID regardless of fullUUID: they are a
+	// diagnostic cross-check list, not the at-a-glance table, so the complete id
+	// stays unambiguous here.
 	marks := degradeMarks(pack, cost)
 	if len(marks) > 0 {
 		fmt.Fprintf(&b, "\nDEGRADED (missing-field marks from agent)\n")
+		degTable := newTable(
+			[]string{"device", "field", "reason"},
+			[]bool{false, false, false},
+		)
 		for _, m := range marks {
-			fmt.Fprintf(&b, "  %-20s %-12s %s\n", m.DeviceUUID, m.Field, m.Reason)
+			degTable.row(m.DeviceUUID, m.Field, m.Reason)
 		}
+		degTable.flush(&b)
 	}
 
 	return b.String()
 }
+
+// table accumulates rows for a single aligned block and renders them through
+// text/tabwriter (TASK-0043). Columns flagged numeric are right-justified: each
+// numeric cell (and its header) is left-padded to the column's widest content
+// BEFORE tabwriter runs, so numbers align on their right edge while tabwriter
+// supplies a uniform inter-column gap; text columns are left as-is and
+// left-aligned by tabwriter's default. Rendering is order-preserving and
+// deterministic — same rows in, byte-identical block out.
+type table struct {
+	headers []string
+	numeric []bool
+	rows    [][]string
+	width   []int // running max display width per column (header + all cells)
+}
+
+func newTable(headers []string, numeric []bool) *table {
+	t := &table{headers: headers, numeric: numeric, width: make([]int, len(headers))}
+	for i, h := range headers {
+		t.width[i] = dispWidth(h)
+	}
+	return t
+}
+
+func (t *table) row(cells ...string) {
+	for i, c := range cells {
+		if w := dispWidth(c); w > t.width[i] {
+			t.width[i] = w
+		}
+	}
+	t.rows = append(t.rows, cells)
+}
+
+// flush writes the header + rows to w as a tab-separated, tabwriter-aligned
+// block (2-space leading indent, 2-space minimum column gap). Numeric cells are
+// right-justified within their column width first so they share a right edge.
+func (t *table) flush(w io.Writer) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, t.line(t.headers))
+	for _, r := range t.rows {
+		fmt.Fprintln(tw, t.line(r))
+	}
+	_ = tw.Flush()
+}
+
+// line joins one record into a leading-indented, tab-separated row, right-
+// justifying numeric cells to their column width so they align on the right.
+func (t *table) line(cells []string) string {
+	out := make([]string, len(cells))
+	for i, c := range cells {
+		if t.numeric[i] {
+			c = pad(c, t.width[i])
+		}
+		out[i] = c
+	}
+	return "  " + strings.Join(out, "\t")
+}
+
+// pad left-pads s with spaces to width w (right-justify); rune-aware so
+// multi-byte content is measured by display runes, not bytes.
+func pad(s string, w int) string {
+	n := w - dispWidth(s)
+	if n <= 0 {
+		return s
+	}
+	return strings.Repeat(" ", n) + s
+}
+
+// dispWidth is the rune count of s — the width tabwriter itself uses for ASCII /
+// single-width content (the only content these tables carry).
+func dispWidth(s string) int { return len([]rune(s)) }
