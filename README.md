@@ -26,7 +26,12 @@ agent -serve -addr 127.0.0.1:9577        # the agent (separate module)
 go run ./cmd/gpufleet view --endpoint http://127.0.0.1:9577
 ```
 
-`--endpoint` defaults to `http://127.0.0.1:9577`. Output (deterministic, sorted):
+`--endpoint` defaults to `http://127.0.0.1:9577`. The `mfu` column is **per-device**;
+on a box exposing only tensor-active (no directly measured achieved-FLOPs) it is a
+**tensor-active-derived estimate** (duty-cycle proxy), not a true achieved-FLOP value.
+The `JOBS` section is populated only when the agent has a **job-label source**
+(scheduler / Prometheus relabel); vanilla DCGM has no job label, so jobs are null
+and the view is device-level. Output (deterministic, sorted):
 
 ```
 gpufleet single-node view  (agent=agent-test, source=local read-only API)
