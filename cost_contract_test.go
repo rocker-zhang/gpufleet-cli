@@ -93,7 +93,7 @@ func TestRenderPerHourColumn(t *testing.T) {
 	// UUID (e.g. "GPU-mock-unpriced", 17 chars) so it must use the --full-uuid
 	// render; the default short-prefix path is covered by view_test.go
 	// (TASK-0043). The $ values asserted below are display-identical in both.
-	out := RenderViewFull(pack, &cost)
+	out := RenderViewFull(pack, &cost, nil)
 
 	// Header carries the new $/hr column alongside waste(win).
 	if !strings.Contains(out, "$/hr") {

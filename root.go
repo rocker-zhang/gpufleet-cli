@@ -56,6 +56,16 @@ func NewRootCmd() *cobra.Command {
 				pack = nil
 			}
 
+			// /verdict is the window-level RCA Verdict from the agent's local open
+			// gate (TASK-0049). It is ADDITIVE to the view: Client.Verdict folds a
+			// pre-window 503 or an unreachable agent into a nil verdict ("no verdict
+			// yet"), so the banner degrades gracefully and a missing verdict never
+			// fails the command. Only a malformed 200 body (wire drift) errors.
+			verdict, verr := c.Verdict(ctx)
+			if verr != nil {
+				return verr
+			}
+
 			// The rendered view is the command's PRIMARY output and MUST go to
 			// STDOUT so it is pipeable / capturable / redirectable (TASK-0042).
 			// The friendly NO-DATA and STALE banners are NORMAL output and ride
@@ -68,7 +78,7 @@ func NewRootCmd() *cobra.Command {
 			if fullUUID {
 				render = RenderViewFull
 			}
-			fmt.Fprint(cmd.OutOrStdout(), render(pack, cost))
+			fmt.Fprint(cmd.OutOrStdout(), render(pack, cost, verdict))
 			return nil
 		},
 	}

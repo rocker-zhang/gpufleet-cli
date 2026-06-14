@@ -3,15 +3,19 @@
 Apache-2.0 · OPEN module · `github.com/rocker-zhang/gpufleet-cli`
 
 A read-only **bypass viewer**. It HTTP-GETs the agent's local read-only API
-(`/signals` — canonical protojson of `gpufleet.v1.EvidencePack` — and `/cost`)
-and renders a deterministic **single-node utilization/cost view**. It is off the
-critical path: it assembles no evidence pack, originates no egress, contacts no
-control plane, and never writes back.
+(`/signals` — canonical protojson of `gpufleet.v1.EvidencePack` — `/cost`, and
+`/verdict` — canonical protojson of `gpufleet.v1.Verdict`) and renders a
+deterministic **single-node utilization/cost view + RCA verdict banner**. It is
+off the critical path: it assembles no evidence pack, originates no egress,
+contacts no control plane, and never writes back.
 
 It is **standalone-useful with no control plane** and contains **no closed
 logic**. The closed control plane (deep playbooks, the gate service, LLM
-narration) is never imported here. RCA/Verdict is M3+, so the verdict column
-renders `n/a (no control plane)` — never fabricated.
+narration) is never imported here. The window-level RCA verdict is the agent's
+local open-gate Verdict, rendered as a banner **verbatim** — cli has no gate of
+its own and never recomputes, judges, or fabricates a fault class. When the agent
+has no verdict yet (pre-window or unreachable), the banner reads
+`RCA: (no verdict yet)`. Deep RCA + narration remain the closed control plane.
 
 ## Use
 
@@ -28,14 +32,27 @@ go run ./cmd/gpufleet view --endpoint http://127.0.0.1:9577
 gpufleet single-node view  (agent=agent-test, source=local read-only API)
 
 DEVICES
-  device               node          mfu   tensor   waste(win)  lowutil  verdict
-  GPU-healthy          n1          0.620    0.700      $0.0000        -  n/a (no control plane)
-  GPU-idle             n1          0.010    0.020      $0.0190      LOW  n/a (no control plane)
+  device         node         mfu  tensor  waste(win)     $/hr  lowutil
+  GPU-healthy    n1         0.620   0.700     $0.0000  $0.0000  -
+  GPU-idle       n1         0.010   0.020     $0.0190  $1.1400  LOW
 
 JOBS
-  job                    waste(win)   priced  devices
-  job-a                     $0.0190      yes        2
+  job    waste(win)     $/hr  priced  devices
+  job-a     $0.0190  $1.1400  yes           2
+
+RCA VERDICT  (window-level, from the agent's local open gate)
+RCA: GPU_FALLEN_OFF_BUS  confidence 0.95  signature GATE_SIGNATURE_XID79_FALLEN_OFF_BUS
+cited signals (2):
+  - device.lost.dcgm.GPU-mock-0001 @ DCGM  (DCGM health: device unreachable on the bus)
+  - dmesg.xid79.GPU-mock-0001 @ DMESG_XID  (NVRM Xid 79 (GPU fallen off the bus))
+note: deep RCA + narration is the closed control plane; the open verdict is class + cited signals + confidence only (no narration).
 ```
+
+When the open ≥2-independent-signal gate does not corroborate a fault class the
+banner instead reads `RCA: ABSTAIN — …` (the honest safe default), and before the
+first window / when the agent is unreachable it reads `RCA: (no verdict yet)`.
+
+An end-to-end M3 demo (FIRE + ABSTAIN) lives in [`demo/m3-demo.sh`](demo/m3-demo.sh).
 
 ## Poly-repo note
 

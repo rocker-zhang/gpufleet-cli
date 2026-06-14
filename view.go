@@ -171,6 +171,40 @@ func (e *statusError) Error() string {
 // structured JSON.
 func (e *statusError) text() string { return strings.TrimSpace(string(e.body)) }
 
+// Verdict GETs /verdict and unmarshals it into the REAL gpufleet.v1.Verdict gen
+// type via protojson (agent CLAUDE.md §5f — same canonical-protojson wire as
+// /signals). cli RENDERS this verdict verbatim; it has no gate and NEVER
+// recomputes, adjudicates, or fabricates a fault class (RULES §B; TASK-0049).
+//
+// Graceful empty state (TASK-0042): like /signals, /verdict answers 503 before
+// the first window exists, and may be unreachable on an older/down agent. Either
+// case returns (nil, nil) — "no verdict yet" — so the caller renders an honest
+// "(no verdict yet)" line instead of crashing or inventing a class. A genuine
+// transport error (agent down) is also folded into the no-verdict-yet state here
+// because the verdict banner is additive to the cost view: the view command
+// already surfaces a down agent via Client.Cost. Only a malformed 200 body (a
+// real wire-contract drift) returns an error.
+func (c *Client) Verdict(ctx context.Context) (*gpufleetv1.Verdict, error) {
+	body, err := c.get(ctx, "/verdict")
+	if err != nil {
+		var serr *statusError
+		if errors.As(err, &serr) {
+			// The agent answered but not 200 (e.g. 503 "no signal window collected
+			// yet" before the first window). No verdict yet — not an error.
+			return nil, nil
+		}
+		// Transport error (agent down / connection refused): no verdict to show.
+		// The cost path is the authority on "cannot reach the agent"; the banner
+		// degrades to "(no verdict yet)" rather than double-reporting the outage.
+		return nil, nil
+	}
+	var v gpufleetv1.Verdict
+	if err := protojson.Unmarshal(body, &v); err != nil {
+		return nil, fmt.Errorf("cli: parse /verdict as gpufleet.v1.Verdict: %w", err)
+	}
+	return &v, nil
+}
+
 // Signals GETs /signals and unmarshals it into the REAL gpufleet.v1.EvidencePack
 // gen type via protojson. cli is the 3rd real consumer of the gen module; it does
 // NOT hand-roll a proto mirror.
@@ -274,29 +308,36 @@ func degradeMarks(pack *gpufleetv1.EvidencePack, cost *CostResponse) []degradeMa
 }
 
 // RenderView produces a deterministic, human-readable single-node view from the
-// agent's /signals EvidencePack and /cost wedge. Output is sorted (by device
-// UUID, then job id) and carries no wall-clock value, so the same inputs render
-// byte-identically. The Verdict column is fixed "n/a (no control plane)" — cli
-// has no rca/gate and NEVER fabricates a verdict (D-0008/D-0010).
+// agent's /signals EvidencePack, /cost wedge, and /verdict (the window-level RCA
+// Verdict from the agent's local open gate, TASK-0049). Output is sorted (by
+// device UUID, then job id) and carries no wall-clock value, so the same inputs
+// render byte-identically.
+//
+// The RCA verdict is window-level (one verdict per window, not per device), so it
+// renders as a BANNER below the device cost table — NOT a per-device column. cli
+// has no rca/gate of its own: it passes the agent's fault class, confidence, and
+// cited signals through VERBATIM and NEVER recomputes, judges, or fabricates a
+// verdict (RULES §B; D-0008/D-0010). A nil verdict ("no verdict yet" — agent
+// pre-window or unreachable) renders an honest placeholder line, never a class.
 //
 // The default render shows each device UUID as a recognizable SHORT prefix so
 // the DEVICES/JOBS columns stay narrow and aligned (TASK-0043). Use
 // RenderViewFull for the whole UUID (the view command's --full-uuid flag).
-func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
-	return renderView(pack, cost, false)
+func RenderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpufleetv1.Verdict) string {
+	return renderView(pack, cost, verdict, false)
 }
 
 // RenderViewFull is RenderView but prints the FULL device UUID instead of the
 // short prefix. It backs the view command's --full-uuid flag (TASK-0043). It
 // changes DISPLAY ONLY — every value/semantic and the deterministic order are
 // identical to RenderView.
-func RenderViewFull(pack *gpufleetv1.EvidencePack, cost *CostResponse) string {
-	return renderView(pack, cost, true)
+func RenderViewFull(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpufleetv1.Verdict) string {
+	return renderView(pack, cost, verdict, true)
 }
 
 // renderView is the shared renderer. fullUUID selects the long vs short UUID
 // display; everything else (values, banners, order, columns) is identical.
-func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, fullUUID bool) string {
+func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpufleetv1.Verdict, fullUUID bool) string {
 	var b strings.Builder
 
 	// Defensive: a nil cost means the caller had no cost payload at all. Treat it as
@@ -364,12 +405,16 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, fullUUID bool
 	// CostImpact.UsdPerHour). For an idle device over a sub-hour window the $/hr
 	// rate exceeds the windowed waste. cli passes both through verbatim; when the
 	// agent reports priced==false (no $/hr rate) it shows a degrade mark `n/a`,
-	// NEVER a fabricated $0. Switching to tabwriter changes LAYOUT ONLY — no
-	// value/semantic, sort, banner, or verdict changes.
+	// NEVER a fabricated $0.
+	//
+	// The per-device "verdict" column is GONE (TASK-0049): the RCA verdict is
+	// window-level (one Verdict per window), so it renders as a banner below this
+	// table, not a column repeated per row. The cost columns
+	// (mfu/tensor/waste/$ /hr/lowutil) are unchanged.
 	fmt.Fprintf(&b, "\nDEVICES\n")
 	devTable := newTable(
-		[]string{"device", "node", "mfu", "tensor", "waste(win)", "$/hr", "lowutil", "verdict"},
-		[]bool{false, false, true, true, true, true, false, false}, // numeric cols right-aligned
+		[]string{"device", "node", "mfu", "tensor", "waste(win)", "$/hr", "lowutil"},
+		[]bool{false, false, true, true, true, true, false}, // numeric cols right-aligned
 	)
 	for _, d := range devs {
 		low := "-"
@@ -390,7 +435,7 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, fullUUID bool
 		devTable.row(
 			uuid, d.Node,
 			fmt.Sprintf("%.3f", d.MFU), fmt.Sprintf("%.3f", d.TensorActive),
-			wasted, perHour, low, "n/a (no control plane)",
+			wasted, perHour, low,
 		)
 	}
 	devTable.flush(&b)
@@ -435,7 +480,81 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, fullUUID bool
 		degTable.flush(&b)
 	}
 
+	// Window-level RCA verdict banner (TASK-0049), below the cost table. The
+	// fault class, confidence, cited signals, and signature are the agent's local
+	// open-gate Verdict, rendered VERBATIM — cli computes nothing here.
+	renderVerdict(&b, verdict)
+
 	return b.String()
+}
+
+// faultClassDisplay strips the wire enum's "FAULT_CLASS_" prefix for a compact
+// banner (e.g. FAULT_CLASS_GPU_FALLEN_OFF_BUS -> GPU_FALLEN_OFF_BUS). It is a
+// DISPLAY transform only: the underlying class is the agent's verbatim enum, never
+// reinterpreted. An unknown/zero class falls back to the raw enum string so a
+// future class is never silently dropped.
+func faultClassDisplay(fc gpufleetv1.FaultClass) string {
+	return strings.TrimPrefix(fc.String(), "FAULT_CLASS_")
+}
+
+// sourceDisplay strips the "SIGNAL_SOURCE_" prefix from a cited signal's source
+// enum for the banner (e.g. SIGNAL_SOURCE_DCGM -> DCGM). Display only.
+func sourceDisplay(s gpufleetv1.SignalSource) string {
+	return strings.TrimPrefix(s.String(), "SIGNAL_SOURCE_")
+}
+
+// renderVerdict appends the deterministic window-level RCA banner. It renders the
+// agent's Verdict VERBATIM (RULES §B): a FIRED class with its confidence,
+// signature, and the cited timeline legs; an honest ABSTAIN message when the open
+// >=2-independent-signal gate did not corroborate a fault class; and an honest
+// "(no verdict yet)" line when the agent has no verdict (pre-window / unreachable).
+// cli never recomputes, thresholds, or fabricates — it only formats what the agent
+// already decided.
+func renderVerdict(b *strings.Builder, v *gpufleetv1.Verdict) {
+	fmt.Fprintf(b, "\nRCA VERDICT  (window-level, from the agent's local open gate)\n")
+
+	// No verdict available: agent pre-window (503) or unreachable. Honest
+	// placeholder — never a fabricated class, never a crash (TASK-0042).
+	if v == nil {
+		fmt.Fprintf(b, "RCA: (no verdict yet) — the agent has not published a verdict for a window yet\n")
+		return
+	}
+
+	fc := v.GetFaultClass()
+	// ABSTAIN (the safe default): the open gate did not corroborate a fault class
+	// from >=2 independent sources this window. State it honestly; imply no fault.
+	// FAULT_CLASS_UNSPECIFIED is treated as ABSTAIN for display safety — an
+	// unspecified class is NOT a fired class, so cli must never present it as one.
+	if fc == gpufleetv1.FaultClass_FAULT_CLASS_ABSTAIN || fc == gpufleetv1.FaultClass_FAULT_CLASS_UNSPECIFIED {
+		fmt.Fprintf(b, "RCA: ABSTAIN — open ≥2-independent-signal gate did not corroborate a fault class this window\n")
+		fmt.Fprintf(b, "note: deep RCA + narration is the closed control plane; the open verdict is class + cited signals + confidence only (no narration).\n")
+		return
+	}
+
+	// FIRED: render the agent's class + confidence + signature, then the cited
+	// signals, VERBATIM. Signature only when the agent set one (non-UNSPECIFIED).
+	fmt.Fprintf(b, "RCA: %s  confidence %.2f", faultClassDisplay(fc), v.GetConfidence())
+	if sig := v.GetSignature(); sig != gpufleetv1.GateSignature_GATE_SIGNATURE_UNSPECIFIED {
+		fmt.Fprintf(b, "  signature %s", sig.String())
+	}
+	fmt.Fprintf(b, "\n")
+
+	// Cited signals — the real timeline legs the gate corroborated on. Sorted by
+	// signalId for deterministic output (cli adds no wall-clock and reorders by a
+	// stable key only; it changes no value).
+	cites := append([]*gpufleetv1.CitedSignal(nil), v.GetCitedSignals()...)
+	sort.Slice(cites, func(i, j int) bool { return cites[i].GetSignalId() < cites[j].GetSignalId() })
+	if len(cites) > 0 {
+		fmt.Fprintf(b, "cited signals (%d):\n", len(cites))
+		for _, c := range cites {
+			fmt.Fprintf(b, "  - %s @ %s", c.GetSignalId(), sourceDisplay(c.GetSource()))
+			if note := c.GetNote(); note != "" {
+				fmt.Fprintf(b, "  (%s)", note)
+			}
+			fmt.Fprintf(b, "\n")
+		}
+	}
+	fmt.Fprintf(b, "note: deep RCA + narration is the closed control plane; the open verdict is class + cited signals + confidence only (no narration).\n")
 }
 
 // table accumulates rows for a single aligned block and renders them through

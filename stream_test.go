@@ -84,7 +84,7 @@ func TestViewStdoutSurvives2DevNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("view error: %v", err)
 	}
-	for _, want := range []string{"DEVICES", "GPU-healthy", "GPU-idle", "n/a (no control plane)"} {
+	for _, want := range []string{"DEVICES", "GPU-healthy", "GPU-idle", "RCA VERDICT"} {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("2>/dev/null must not lose %q from STDOUT; stdout:\n%s", want, stdout)
 		}

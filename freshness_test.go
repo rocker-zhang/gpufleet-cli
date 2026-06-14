@@ -63,7 +63,7 @@ func TestRenderStaleMarker(t *testing.T) {
 		t.Fatalf("stub /cost should decode stale=true into cli DTO")
 	}
 
-	out := RenderView(pack, cost)
+	out := RenderView(pack, cost, nil)
 
 	// Data-age line present with the agent-reported age.
 	if !strings.Contains(out, "data age: 42.5s") {
@@ -103,7 +103,7 @@ func TestRenderFreshNoStaleMarker(t *testing.T) {
 	if cost.Stale {
 		t.Fatalf("fresh stub must decode stale=false")
 	}
-	out := RenderView(pack, cost)
+	out := RenderView(pack, cost, nil)
 	if strings.Contains(out, "STALE") {
 		t.Errorf("fresh render must NOT show a STALE marker:\n%s", out)
 	}
@@ -129,7 +129,7 @@ func TestStaleRenderDeterministic(t *testing.T) {
 	pack, _ := c.Signals(ctx)
 	cost, _ := c.Cost(ctx)
 	var _ *gpufleetv1.EvidencePack = pack
-	if a, b := RenderView(pack, cost), RenderView(pack, cost); a != b {
+	if a, b := RenderView(pack, cost, nil), RenderView(pack, cost, nil); a != b {
 		t.Errorf("stale render not deterministic")
 	}
 }
@@ -177,7 +177,7 @@ func TestRenderNeverCollectedGraceful(t *testing.T) {
 		t.Fatalf("never-collected /cost should decode never_collected+stale: %+v", cost)
 	}
 
-	out := RenderView(nil, cost) // /signals was 503, so pack may be nil — must not panic
+	out := RenderView(nil, cost, nil) // /signals was 503, so pack may be nil — must not panic
 	if !strings.Contains(out, "NO DATA") {
 		t.Errorf("expected a clear NO DATA message:\n%s", out)
 	}
@@ -215,7 +215,7 @@ func TestCostGracefulOn503(t *testing.T) {
 	if !strings.Contains(cost.StaleReason, "no signal window collected yet") {
 		t.Fatalf("503 reason should carry the agent's message: %q", cost.StaleReason)
 	}
-	out := RenderView(nil, cost)
+	out := RenderView(nil, cost, nil)
 	if !strings.Contains(out, "NO DATA") || strings.Contains(out, "status 503") {
 		t.Errorf("503 must render a clear message, not a raw HTTP error:\n%s", out)
 	}

@@ -182,13 +182,13 @@ var jobNumeric = map[int]bool{1: true, 2: true, 4: true}          // waste,$/hr,
 // tabwriter render puts every DEVICES value under its header — text columns
 // share the header's left edge, numeric columns share its right edge.
 func TestDevicesColumnsAlignUnderHeaders(t *testing.T) {
-	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "align"}, longUUIDCost())
+	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "align"}, longUUIDCost(), nil)
 	assertAligned(t, "DEVICES", section(out, "DEVICES"), devNumeric)
 }
 
 // TestJobsColumnsAlignUnderHeaders mirrors the DEVICES check for the JOBS block.
 func TestJobsColumnsAlignUnderHeaders(t *testing.T) {
-	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "align"}, longUUIDCost())
+	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "align"}, longUUIDCost(), nil)
 	assertAligned(t, "JOBS", section(out, "JOBS"), jobNumeric)
 }
 
@@ -196,7 +196,7 @@ func TestJobsColumnsAlignUnderHeaders(t *testing.T) {
 // prefix (first 13 chars + ellipsis), NOT the full 36-char UUID, in the DEVICES
 // table — while the prefix still uniquely identifies each device.
 func TestShortUUIDDefault(t *testing.T) {
-	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "short"}, longUUIDCost())
+	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "short"}, longUUIDCost(), nil)
 
 	full := "GPU-1e760802-aaaa-bbbb-cccc-0123456789ab"
 	prefix := "GPU-1e760802-" // 13 chars
@@ -221,7 +221,7 @@ func TestShortUUIDDefault(t *testing.T) {
 // renders the entire UUID and no ellipsis, and that columns STILL align under
 // their headers with the wider content.
 func TestFullUUIDOptShowsWholeUUID(t *testing.T) {
-	out := RenderViewFull(&gpufleetv1.EvidencePack{AgentId: "full"}, longUUIDCost())
+	out := RenderViewFull(&gpufleetv1.EvidencePack{AgentId: "full"}, longUUIDCost(), nil)
 
 	full := "GPU-1e760802-aaaa-bbbb-cccc-0123456789ab"
 	if !strings.Contains(out, full) {
@@ -242,7 +242,7 @@ func TestFullUUIDOptShowsWholeUUID(t *testing.T) {
 // SAME field starts for the numeric columns — only possible if they are
 // right-justified to a common width.
 func TestNumericColumnsRightAligned(t *testing.T) {
-	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "num"}, longUUIDCost())
+	out := RenderView(&gpufleetv1.EvidencePack{AgentId: "num"}, longUUIDCost(), nil)
 	rows := section(out, "DEVICES")
 	if len(rows) < 3 {
 		t.Fatalf("need multiple data rows:\n%s", out)
@@ -318,10 +318,10 @@ func TestFullUUIDFlagStillOnStdout(t *testing.T) {
 func TestAlignRenderDeterministic(t *testing.T) {
 	pack := &gpufleetv1.EvidencePack{AgentId: "det"}
 	c := longUUIDCost()
-	if a, b := RenderView(pack, c), RenderView(pack, c); a != b {
+	if a, b := RenderView(pack, c, nil), RenderView(pack, c, nil); a != b {
 		t.Errorf("tabwriter render not deterministic")
 	}
-	if a, b := RenderViewFull(pack, c), RenderViewFull(pack, c); a != b {
+	if a, b := RenderViewFull(pack, c, nil), RenderViewFull(pack, c, nil); a != b {
 		t.Errorf("full-uuid tabwriter render not deterministic")
 	}
 }

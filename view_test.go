@@ -65,6 +65,18 @@ func agentStub(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(costJSON))
 	})
+	// /verdict: a healthy mock window ABSTAINs (the open >=2-signal gate found no
+	// corroborated fault), served as canonical gpufleet.v1.Verdict protojson — the
+	// agent's default no-inject behavior (agent CLAUDE.md §5f).
+	abstain := abstainVerdictProtoJSON(t)
+	mux.HandleFunc("/verdict", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "read-only", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(abstain))
+	})
 	return httptest.NewServer(mux)
 }
 
@@ -96,7 +108,12 @@ func TestViewEndToEnd(t *testing.T) {
 		t.Fatalf("Cost: %v", err)
 	}
 
-	out := RenderView(pack, cost)
+	verdict, err := c.Verdict(ctx)
+	if err != nil {
+		t.Fatalf("Verdict: %v", err)
+	}
+
+	out := RenderView(pack, cost, verdict)
 
 	// Healthy device: wasted $0.0000, not LOW.
 	healthyLine := lineContaining(out, "GPU-healthy")
@@ -122,9 +139,13 @@ func TestViewEndToEnd(t *testing.T) {
 		t.Errorf("idle device should be flagged LOW:\n%s", idleLine)
 	}
 
-	// Verdict column is fixed n/a — never fabricated.
-	if !strings.Contains(out, "n/a (no control plane)") {
-		t.Errorf("verdict must be n/a (no control plane):\n%s", out)
+	// The verdict is now a window-level RCA banner (TASK-0049), no longer a
+	// per-device "n/a (no control plane)" column. The healthy mock window ABSTAINs.
+	if strings.Contains(out, "n/a (no control plane)") {
+		t.Errorf("the per-device n/a verdict column must be GONE:\n%s", out)
+	}
+	if !strings.Contains(out, "RCA: ABSTAIN") {
+		t.Errorf("healthy window should render an ABSTAIN RCA banner:\n%s", out)
 	}
 
 	// Deterministic order: GPU-healthy sorts before GPU-idle.
@@ -141,8 +162,8 @@ func TestViewDeterministic(t *testing.T) {
 	ctx := context.Background()
 	pack, _ := c.Signals(ctx)
 	cost, _ := c.Cost(ctx)
-	a := RenderView(pack, cost)
-	b := RenderView(pack, cost)
+	a := RenderView(pack, cost, nil)
+	b := RenderView(pack, cost, nil)
 	if a != b {
 		t.Errorf("render not deterministic")
 	}
@@ -164,7 +185,7 @@ func TestDegradeMarksPassThrough(t *testing.T) {
 		{UUID: "GPU-priced", Priced: true},
 		{UUID: "GPU-unpriced", Priced: false},
 	}}
-	out := RenderView(pack, cost)
+	out := RenderView(pack, cost, nil)
 	if !strings.Contains(out, "GPU-omitted") || !strings.Contains(out, "mfu") {
 		t.Errorf("expected mfu degrade mark for omitted device:\n%s", out)
 	}
