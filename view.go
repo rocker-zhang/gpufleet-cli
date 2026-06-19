@@ -440,6 +440,11 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpuf
 	}
 	devTable.flush(&b)
 
+	// TOP WASTED-$ digest (TASK-0055, G4 money-story wedge): the window's biggest
+	// device-level wasted-$ offenders, ranked, plus the window total. This is the
+	// "money story" digest the assessment flagged as the least-finished piece.
+	renderTopWasted(&b, devs, fullUUID)
+
 	// Deterministic job table, sorted by job id.
 	jobs := append([]JobCost(nil), cost.Jobs...)
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].JobID < jobs[j].JobID })
@@ -486,6 +491,113 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpuf
 	renderVerdict(&b, verdict)
 
 	return b.String()
+}
+
+// topWastedN is how many device-level offenders the TOP WASTED-$ digest lists.
+const topWastedN = 5
+
+// renderTopWasted appends the "TOP WASTED-$ (this window)" digest: the window's
+// biggest wasted-$ offenders ranked descending, plus the window total wasted-$
+// and total idle burn rate (TASK-0055, G4 money-story wedge).
+//
+// SCOPE — stated honestly in the header and here:
+//   - DEVICE-LEVEL only. Vanilla DCGM carries no job label, so there is no
+//     honest job-level attribution; the digest never invents one (job-level
+//     attribution remains an infra/job-label input — a blocked TASK-0055 part).
+//   - SINGLE-WINDOW only. This ranks exactly the one window cli fetched from
+//     /cost; a multi-window "wasted-$ last week" rollup needs a historical store
+//     to accumulate per-window waste, which is OUT OF SCOPE (the remaining
+//     TASK-0055 follow-up).
+//   - The $ values are only as real as the agent's configured/spec $/hour rate
+//     (an operator input, placeholder until supplied) — cli passes them through
+//     verbatim and NEVER fabricates a number.
+//
+// Determinism + honesty: the input devs are already UUID-sorted by the caller;
+// this re-sorts a COPY by wasted-$ descending with a stable UUID tie-break
+// (matching semantics.TopWastedUSD), adds no wall-clock, and only sums PRICED
+// devices. Unpriced devices are shown with "n/a", never $0, and excluded from the
+// total. When nothing is priced (or there are no devices) it degrades to a single
+// honest line instead of a fabricated total.
+func renderTopWasted(b *strings.Builder, devs []DeviceCost, fullUUID bool) {
+	fmt.Fprintf(b, "\nTOP WASTED-$ (this window, device-level — vanilla DCGM has no job label)\n")
+
+	if len(devs) == 0 {
+		fmt.Fprintf(b, "  (no device data)\n")
+		return
+	}
+
+	// Rank a COPY by wasted-$ descending, stable tie-break by UUID ascending.
+	// Unpriced devices have WastedUSD==0 and sort among the $0 devices by UUID.
+	ranked := append([]DeviceCost(nil), devs...)
+	sort.Slice(ranked, func(i, j int) bool {
+		ai, aj := ranked[i].Priced, ranked[j].Priced
+		// Priced devices always outrank unpriced ones (an unpriced device's 0 is
+		// "unknown", not "zero waste"), so they never crowd out a real offender.
+		if ai != aj {
+			return ai
+		}
+		if ranked[i].WastedUSD != ranked[j].WastedUSD {
+			return ranked[i].WastedUSD > ranked[j].WastedUSD
+		}
+		return ranked[i].UUID < ranked[j].UUID
+	})
+
+	// Window totals over PRICED devices only — never fabricate a total for an
+	// unpriced device.
+	var totalWasted, totalPerHour float64
+	priced, unpriced := 0, 0
+	for _, d := range devs {
+		if d.Priced {
+			totalWasted += d.WastedUSD
+			totalPerHour += d.UsdPerHour
+			priced++
+		} else {
+			unpriced++
+		}
+	}
+
+	if priced == 0 {
+		// No device had a $/hour rate: there is no honest $ to report.
+		fmt.Fprintf(b, "  no priced devices (no $/hour rate configured) — wasted-$ unavailable; configure a rate to populate this digest\n")
+		return
+	}
+
+	n := topWastedN
+	if n > len(ranked) {
+		n = len(ranked)
+	}
+	t := newTable(
+		[]string{"#", "device", "node", "mfu", "idle", "waste(win)", "$/hr"},
+		[]bool{true, false, false, true, true, true, true},
+	)
+	for i := 0; i < n; i++ {
+		d := ranked[i]
+		uuid := d.UUID
+		if !fullUUID {
+			uuid = shortUUID(uuid)
+		}
+		wasted := fmt.Sprintf("$%.4f", d.WastedUSD)
+		perHour := fmt.Sprintf("$%.4f", d.UsdPerHour)
+		if !d.Priced {
+			// Unpriced ⇒ $ unknown; degrade-mark, never $0.
+			wasted = "n/a"
+			perHour = "n/a"
+		}
+		t.row(
+			fmt.Sprintf("%d", i+1), uuid, d.Node,
+			fmt.Sprintf("%.3f", d.MFU), fmt.Sprintf("%.3f", d.IdleFraction),
+			wasted, perHour,
+		)
+	}
+	t.flush(b)
+
+	fmt.Fprintf(b, "  window total wasted-$: $%.4f   idle burn rate: $%.4f/hr   (across %d priced device(s)",
+		totalWasted, totalPerHour, priced)
+	if unpriced > 0 {
+		fmt.Fprintf(b, "; %d unpriced excluded", unpriced)
+	}
+	fmt.Fprintf(b, ")\n")
+	fmt.Fprintf(b, "  NOTE: single-window digest. A multi-window \"wasted-$ last week\" rollup needs a historical store (out of scope — TASK-0055 follow-up); $/hr & job-labels are operator/infra inputs.\n")
 }
 
 // faultClassDisplay strips the wire enum's "FAULT_CLASS_" prefix for a compact
