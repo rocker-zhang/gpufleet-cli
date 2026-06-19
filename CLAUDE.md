@@ -5,9 +5,10 @@
 - **class**: OPEN (Apache-2.0)
 - **language**: Go
 - **kind**: viewer (CLI/TUI)
-- **purpose (one line)**: a read-only bypass viewer that renders job-level
+- **purpose (one line)**: a read-only bypass viewer that renders device-level
   utilization / $cost / Verdict — single-node from the agent's local API (open),
-  fleet from the controlplane (paid).
+  fleet from the controlplane (paid). (Jobs are shown only when the agent has a
+  job-label source; vanilla DCGM has no job label, so the default view is device-level.)
 - **on-path | bypass | shared-lib**: **bypass**. cli is NEVER on the data-plane
   upload path. It originates no evidence-pack egress. The agent uploads; cli only
   reads and renders.
@@ -70,9 +71,10 @@ Inherits `../RULES.md` in full. Module-specific hard lines:
 - **TASK-0020 governs**: cli reads the agent local API and renders the TUI; it
   ASSEMBLES NO pack, sends NO HTTPS, receives NO controlplane Verdict on the data
   plane. D-0010 amends this with the second (paid, read-only) fleet endpoint.
-- **Current milestone (M2)**: end-to-end render of job-level utilization + $cost
+- **Current milestone (M2)**: end-to-end render of device-level utilization + $cost
   attribution from the agent local API, standalone with no control plane (the
-  money story / demo1).
+  money story / demo1). Per-job rollup is rendered only when the agent exposes a
+  job-label source; vanilla DCGM has none, so the default view is device-level.
 
 ## 5. 构建与测试
 
@@ -102,7 +104,7 @@ go vet ./...
 ## 7. 模块路线图 (mirror ROADMAP.md)
 
 - **M1** — consume `proto` (open Verdict + aggregation envelope, read-only); skeleton viewer.
-- **M2** — render job-level MFU + $cost from the agent local API (Endpoint 1), standalone, no control plane. (money story)
+- **M2** — render device-level MFU + $cost from the agent local API (Endpoint 1), standalone, no control plane (per-job rollup only when a job-label source exists). (money story)
 - **M3** — render deterministic RCA Verdict + ABSTAIN from the agent local API.
 - **M4** — render the public scorecard view; no answer-key, no closed logic.
 - **M5** — Endpoint 2: read-only fleet view from the controlplane (paid, server-side license); render cross-node cost + deep verdict.

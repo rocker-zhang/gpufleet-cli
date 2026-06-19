@@ -13,7 +13,7 @@ import (
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "gpufleet",
-		Short: "gpufleet read-only viewer — job-level utilization & $cost from the agent's local API",
+		Short: "gpufleet read-only viewer — device-level utilization & $cost from the agent's local API",
 		Long: "gpufleet is a read-only BYPASS viewer. It reads the agent's local\n" +
 			"read-only HTTP API (/signals + /cost) and renders a deterministic\n" +
 			"single-node utilization/cost view. It is off the critical path: it\n" +
