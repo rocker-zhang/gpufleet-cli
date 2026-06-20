@@ -14,11 +14,13 @@ func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "gpufleet",
 		Short: "gpufleet read-only viewer — device-level utilization & $cost from the agent's local API",
-		Long: "gpufleet is a read-only BYPASS viewer. It reads the agent's local\n" +
-			"read-only HTTP API (/signals + /cost) and renders a deterministic\n" +
-			"single-node utilization/cost view. It is off the critical path: it\n" +
-			"assembles no evidence pack, originates no egress, contacts no control\n" +
-			"plane, and never writes back. No control plane is required.",
+		Long: "gpufleet is a read-only viewer. The `view` command reads the agent's\n" +
+			"local read-only HTTP API (/signals + /cost) and renders a deterministic\n" +
+			"single-node utilization/cost view — off the critical path: it assembles\n" +
+			"no evidence pack, originates no egress, and never writes back.\n\n" +
+			"The `fleet` command is the one paid-tier exception: it makes an explicit\n" +
+			"opt-in HTTPS request to the closed control plane's /v1/fleet endpoint and\n" +
+			"renders the fleet view it returns. It still adjudicates nothing.",
 		SilenceUsage: true,
 	}
 
@@ -88,5 +90,6 @@ func NewRootCmd() *cobra.Command {
 		"show the full device UUID instead of the default short prefix")
 
 	root.AddCommand(viewCmd)
+	root.AddCommand(newFleetCmd())
 	return root
 }
