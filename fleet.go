@@ -83,7 +83,12 @@ func (c *FleetClient) Fleet(ctx context.Context) (*gpufleetv1.AggregationEnvelop
 		return nil, fmt.Errorf("cli fleet: control plane returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	env := &gpufleetv1.AggregationEnvelope{}
-	if err := protojson.Unmarshal(body, env); err != nil {
+	// Forward-compatible decode: this body comes from the CLOSED control plane,
+	// which may ship a newer minor contract with additive fields. DiscardUnknown
+	// keeps the paid view working against a forward-compatible envelope instead of
+	// hard-failing on an unknown field. (The local /signals + /verdict paths stay
+	// strict — there the agent is the same version and drift IS a bug.)
+	if err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal(body, env); err != nil {
 		return nil, fmt.Errorf("cli fleet: parse /v1/fleet as gpufleet.v1.AggregationEnvelope: %w", err)
 	}
 	return env, nil

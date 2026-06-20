@@ -237,9 +237,15 @@ func (c *Client) Cost(ctx context.Context) (*CostResponse, error) {
 			// The agent answered but not 200 (e.g. an older agent's 503 "no signal
 			// window collected yet"). Treat it as a never-collected empty state.
 			var cost CostResponse
-			if jerr := json.Unmarshal(serr.body, &cost); jerr == nil && (cost.NeverCollected || len(cost.Devices) == 0) {
-				cost.NeverCollected = true
+			if jerr := json.Unmarshal(serr.body, &cost); jerr == nil {
+				// The non-200 body decoded to a real CostResponse — honor it. If it
+				// carries devices (e.g. a 503 with the last stale window), keep them
+				// and just flag stale; only treat it as never-collected when the body
+				// itself says so or has no devices. Never discard a populated body.
 				cost.Stale = true
+				if !cost.NeverCollected && len(cost.Devices) == 0 {
+					cost.NeverCollected = true
+				}
 				if cost.StaleReason == "" {
 					cost.StaleReason = serr.text()
 				}
@@ -359,7 +365,7 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpuf
 	// never a silently blank table — and stop. This also covers the defensive case
 	// where /cost returned no devices while flagged stale (an older agent's empty
 	// 503 body decoded into NeverCollected by Client.Cost).
-	if cost.NeverCollected || (cost.Stale && len(cost.Devices) == 0) {
+	if cost.NeverCollected {
 		reason := cost.StaleReason
 		if reason == "" {
 			reason = "agent has not collected any metrics yet (exporter unreachable?)"
@@ -369,6 +375,18 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpuf
 		fmt.Fprintf(&b, "the exporter may be unreachable, or the agent just started — retry shortly.\n")
 		return b.String()
 	}
+	// Distinct from never-collected: a stale window that DID collect before but
+	// now reports zero devices (all unmapped/removed). Don't claim "never
+	// collected any metrics" — say what's actually true.
+	if cost.Stale && len(cost.Devices) == 0 {
+		reason := cost.StaleReason
+		if reason == "" {
+			reason = "no devices currently reported"
+		}
+		fmt.Fprintf(&b, "*** STALE / NO DEVICES ***  the last window reported no GPUs\n")
+		fmt.Fprintf(&b, "reason: %s\n", reason)
+		return b.String()
+	}
 
 	// Data-freshness line (TASK-0040): the agent-side age since its last SUCCESSFUL
 	// collection, passed through verbatim from /cost (deterministic — no cli
@@ -376,7 +394,13 @@ func renderView(pack *gpufleetv1.EvidencePack, cost *CostResponse, verdict *gpuf
 	// the agent's reason so a held-stale window is NEVER shown as current (RULES
 	// §B). The data values below are the last-known window, kept but explicitly
 	// flagged — not blanked, not fabricated.
-	fmt.Fprintf(&b, "data age: %.1fs", cost.AgeSeconds)
+	// A negative age means the agent's clock is ahead of ours (skew); show it
+	// honestly rather than printing a nonsensical "-3.0s" as if it were real.
+	if cost.AgeSeconds < 0 {
+		fmt.Fprintf(&b, "data age: 0.0s (agent clock ahead by %.1fs?)", -cost.AgeSeconds)
+	} else {
+		fmt.Fprintf(&b, "data age: %.1fs", cost.AgeSeconds)
+	}
 	if cost.Stale {
 		fmt.Fprintf(&b, "   *** STALE ***")
 		if cost.StaleReason != "" {
