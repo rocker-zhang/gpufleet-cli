@@ -23,4 +23,3 @@ require (
 // against the vendored REAL gen types — NOT a hand-rolled mirror. cli reads the
 // agent over HTTP (TASK-0020 / TASK-0016), so it links NO sibling Go module
 // other than the read-only proto contract: no agent, no rca, no semantics.
-replace github.com/rocker-zhang/gpufleet-proto/gen/go => ../proto/gen/go
